@@ -46,8 +46,6 @@ let numWins = 0;
 let numLosses = 0;
 let lastSignature = null;
 
-const RACE_NAMES = { H: 'Human', O: 'Orc', N: 'Night Elf', U: 'Undead' };
-
 // Replay writing lifecycle: the game (re)creates LastReplay.w3g when a game
 // starts and keeps appending to it until the game finishes. So a change event
 // mid-game means the file is a partial replay — enough to read the header
@@ -273,25 +271,18 @@ function raceLetter(flag) {
 
 async function postGameStart(p) {
   const header = await headerPlayers(p);
-  const humans = header.players.filter((pl) => pl.name.includes('#'));
 
-  const playerNames = [];
-  const playerStats = [];
+  const rows = [];
   for (const pl of header.players) {
-    playerNames.push(`${pl.name} — ${raceLabel({ race: pl.race, raceDetected: '' })}`);
-    playerStats.push(pl.name.includes('#') ? await statsLineFor(pl.name) : '—');
+    const s = pl.name.includes('#') ? await statsFor(pl.name) : { kind: 'none' };
+    rows.push([pl.name, raceCode(pl), careerCell(s), seasonCell(s)]);
   }
 
   const embed = new EmbedBuilder()
     .setTitle('Game starting')
     .setColor(0x0099ff)
-    .addFields({ name: 'Map', value: safeValue(header.map && (header.map.file || header.map)) });
-  if (humans.length > 0) {
-    embed.addFields(
-      { name: 'Player', value: playerNames.join('\n'), inline: true },
-      { name: 'Stats', value: playerStats.join('\n'), inline: true },
-    );
-  }
+    .addFields({ name: 'Map', value: safeValue(header.map && (header.map.file || header.map)) })
+    .addFields({ name: 'Players', value: monoTable(['Player', 'Race', 'Career', 'Season'], rows) });
 
   if (dryrun) return printEmbed(embed, '(game start)');
   await sendToChannel(embed);
@@ -312,13 +303,14 @@ async function postGameEnd(p, result) {
     else numLosses++;
   }
 
-  const playerNames = [];
-  const playerApms = [];
-  for (const player of result.players) {
-    playerNames.push(`${player.name} — ${raceLabel(player)}`);
-    playerApms.push(String(player.apm));
-  }
-  const playerStats = await Promise.all(result.players.map((pl) => statsLineFor(pl.name)));
+  const stats = await Promise.all(result.players.map((pl) => (pl.name.includes('#') ? statsFor(pl.name) : { kind: 'none' })));
+  const rows = result.players.map((pl, i) => [
+    pl.name,
+    raceCode(pl),
+    String(pl.apm),
+    careerCell(stats[i]),
+    seasonCell(stats[i]),
+  ]);
 
   const embed = new EmbedBuilder();
   if (myTeam === null) {
@@ -330,11 +322,7 @@ async function postGameEnd(p, result) {
   }
 
   embed.addFields({ name: 'Map', value: result.map.file });
-  embed.addFields(
-    { name: 'Player', value: playerNames.join('\n'), inline: true },
-    { name: 'APM', value: playerApms.join('\n'), inline: true },
-    { name: 'Stats', value: playerStats.join('\n'), inline: true },
-  );
+  embed.addFields({ name: 'Players', value: monoTable(['Player', 'Race', 'APM', 'Career', 'Season'], rows) });
   embed.addFields(
     { name: 'Game Length', value: millisToMinutesAndSeconds(result.duration), inline: true },
     { name: 'Average', value: millisToMinutesAndSeconds(avgSessionDuration), inline: true },
@@ -399,14 +387,6 @@ function namePart(name) {
   return String(name).split('#')[0].toLowerCase();
 }
 
-function raceLabel(player) {
-  if (player.race === 'R') {
-    const detected = RACE_NAMES[player.raceDetected] || player.raceDetected || '?';
-    return `${detected} (Random)`;
-  }
-  return RACE_NAMES[player.race] || player.race;
-}
-
 function safeValue(v) {
   const s = String(v || 'unknown');
   return s.length > 1024 ? s.slice(0, 1021) + '...' : s;
@@ -417,8 +397,10 @@ function safeValue(v) {
 // No cache: every replay triggers fresh lookups for every player.
 // ---------------------------------------------------------------------------
 
-async function statsLineFor(name) {
-  if (!name.includes('#')) return '—'; // AI/"Computer" players have no profile
+// Returns { kind: 'ok', wl: {career, season} } | { kind: 'nogames' | 'offline' |
+// 'timeout' | 'error' | 'none' }
+async function statsFor(name) {
+  if (!name.includes('#')) return { kind: 'none' }; // AI/"Computer" players
   let res;
   try {
     // Generous timeout: the service talks to the game serially, and if the
@@ -426,26 +408,59 @@ async function statsLineFor(name) {
     res = await axios.get(`${STATSURL}/profile/${encodeURIComponent(name)}`, { timeout: 90000 });
   } catch (err) {
     const status = err.response && err.response.status;
-    if (status === 404) return '(no ladder games)';
-    if (status === 503) return '(stats offline — game not running?)';
-    if (status === 504) return '(stats timeout)';
+    if (status === 404) return { kind: 'nogames' };
+    if (status === 503) return { kind: 'offline' };
+    if (status === 504) return { kind: 'timeout' };
     console.log(`Stats lookup failed for ${name}: ${err.message}`);
-    return '(stats error)';
+    return { kind: 'error' };
   }
   const wl = res.data && res.data.wl;
-  if (!wl || !wl.career) return '(no ladder games)';
-  let line = wlLine(wl.career);
-  if (wl.season && wl.season.wins + wl.season.losses > 0) {
-    line += ` · this season ${wlLine(wl.season)}`;
-  }
-  return line;
+  if (!wl || !wl.career) return { kind: 'nogames' };
+  return { kind: 'ok', wl };
 }
 
-// W/L display for a {wins, losses} pair
-function wlLine({ wins, losses }) {
+function wlCell({ wins, losses }) {
   const total = wins + losses;
   if (total === 0) return '0-0';
-  return `${wins}-${losses} (${((wins / total) * 100).toFixed(2)}%)`;
+  return `${wins}-${losses} (${Math.round((wins / total) * 100)}%)`;
+}
+
+function careerCell(s) {
+  if (!s) return '—';
+  if (s.kind === 'ok') return wlCell(s.wl.career);
+  if (s.kind === 'nogames') return 'no games';
+  if (s.kind === 'offline') return '(offline)';
+  if (s.kind === 'timeout') return '(timeout)';
+  return '(error)';
+}
+
+function seasonCell(s) {
+  if (!s || s.kind !== 'ok' || !s.wl.season) return '—';
+  return wlCell(s.wl.season);
+}
+
+// compact race display for the table: HU/OC/NE/UD, "(R)" suffix when random
+function raceCode(player) {
+  const codes = { H: 'HU', O: 'OC', N: 'NE', U: 'UD' };
+  const code = codes[player.race] || player.race;
+  if (player.race === 'R') {
+    return `${codes[player.raceDetected] || '??'} (R)`;
+  }
+  return code;
+}
+
+// A padded monospace table. Discord wraps long lines inside inline fields,
+// which desyncs any multi-column layout — a code block never re-flows, so
+// rows stay aligned no matter how long the content is.
+function monoTable(headers, rows) {
+  const width = headers.map((h, i) =>
+    Math.max(h.length, ...rows.map((r) => String(r[i] ?? '').length)));
+  const line = (cells) => cells
+    .map((c, i) => String(c ?? '').padEnd(width[i]))
+    .join('  ')
+    .replace(/\s+$/, '');
+  const text = [line(headers), ...rows.map(line)].join('\n');
+  return '```\n' + text.slice(0, 1000) + '\n```';
 }
 
 const millisToMinutesAndSeconds = (millis) => {
