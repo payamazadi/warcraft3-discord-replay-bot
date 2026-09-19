@@ -1,9 +1,19 @@
 {
+  "name": "warcraft3-discord-replay-bot",
+  "version": "2.0.0",
+  "description": "Watches your WC3 LastReplay.w3g and posts game/session summaries to Discord, with player W/L stats from the local wc3-re stats service.",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
-    "axios": "^0.21.1",
-    "chokidar": "^3.5.0",
-    "discord.js": "^12.5.1",
-    "dotenv": "^8.2.0",
-    "w3gjs": "^2.3.0"
+    "axios": "^1.7.9",
+    "chokidar": "^3.6.0",
+    "discord.js": "^14.27.0",
+    "dotenv": "^16.4.5",
+    "w3gjs": "^4.2.0"
   }
 }
