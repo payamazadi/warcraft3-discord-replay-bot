@@ -19,7 +19,7 @@ cache; if the game isn't running the embed says so instead of showing old number
    (ladder 1v1s). For team games it falls back to the classic heuristic: the team whose
    players spent the most time in game was on the winning side.
 4. Every player's W/L record is fetched live — the local stats service
-   (`wc3-re/service/live-server.js`) connects to the game's own websocket bridge and
+   (`service/live-server.js` in this repo) connects to the game's own websocket bridge and
    asks it for each player's profile right now — and the embed is posted to Discord.
 
 ## Requirements
@@ -47,16 +47,16 @@ cache; if the game isn't running the embed says so instead of showing old number
    `Documents\Warcraft III\BattleNet\<account folder>\Replays\LastReplay.w3g`
    (check the timestamps to find your live account folder).
 
-3. Start the live stats service (from the `wc3-re` project):
+3. Start the live stats service — it ships in this repo:
 
    ```bat
-   cd C:\Users\payam\.zcode\workspace\default\wc3-re\service
+   cd service
    node live-server.js
    ```
 
    Warcraft III must be running and logged in — every stats lookup goes to the game
    right then. The service auto-rescans the game's bridge endpoint when the game
-   restarts. (The old `server.ps1` + `stats.json` cache design is deprecated.)
+   restarts. Details in `service/README.md`.
 
 4. `node main.js`
 
