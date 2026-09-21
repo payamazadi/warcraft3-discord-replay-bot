@@ -59,7 +59,6 @@ let lastChangeAtMs = 0;
 let handlingReplay = false;
 let pendingReplayPath = null;
 
-const GROWTH_CHECK_MS = 4000;       // re-stat after this long to detect live writing
 const GAME_END_QUIET_MS = 15000;    // no writes for this long -> game is over
 const GIVE_UP_AFTER_MS = 180000;    // file quiet but unparseable -> give up eventually
 const HEADER_PARSE_TIMEOUT_MS = 15000;
@@ -159,23 +158,19 @@ async function handleReplayEvent(p) {
     return;
   }
 
-  // idle: something wrote the replay file. Could be a live game (header
-  // written at start, data appended during play) or a finished replay
-  // (game end / a copy). Distinguish:
-  //   file quiet + complete parse + real game duration -> end summary
-  //   still being written, or parse fails, or zero-duration parse     -> game start
+  // idle: something wrote the replay file. The game dumps the replay when a
+  // game finishes (and creates a header-only file when one starts), so:
+  //   complete parse + real game duration -> end summary
+  //   parse fails or tiny duration        -> game just started, post live stats
   let parsed = null;
   try {
     parsed = await parseWithLeaves(p);
   } catch {
-    parsed = null; // partial replay — expected for a game in progress
+    parsed = null; // partial/header-only replay — expected right at game start
   }
   if (replayState !== 'idle') return; // re-entered while we were parsing
 
-  const growing = await fileStillGrowing(p);
-  if (replayState !== 'idle') return;
-
-  if (!growing && parsed && parsed.result.duration >= 30000) {
+  if (parsed && parsed.result.duration >= 30000) {
     await postGameEnd(p, parsed.result, parsed.leaves);
     return;
   }
@@ -187,13 +182,6 @@ async function handleReplayEvent(p) {
   } catch (err) {
     console.log(`Could not read game-start info from ${p}: ${err.message}`);
   }
-}
-
-async function fileStillGrowing(p) {
-  const before = fileSignature(p);
-  await sleep(GROWTH_CHECK_MS);
-  const after = fileSignature(p);
-  return Boolean(before && after && before !== after);
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
