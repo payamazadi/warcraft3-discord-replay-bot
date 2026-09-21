@@ -102,17 +102,9 @@ take up to a minute, the rest are fast.
 - The old `profile.w3booster.com` lookup (dead service) has been replaced by the local
   stats service.
 
-## How to Setup (original guide)
+## Discord Server Setup
 
-The original setup walkthrough from the first version of this bot, kept as it was.
-Two details were updated to match the current code: `.env.tmp` is now `.env.example`,
-and the testing toggle moved from a constant in `main.js` to `TESTING=1` in `.env`.
-
-1. Checkout the code
-2. npm install
-3. Copy .env.example to .env
-4. Setup your Discord bot https://discordpy.readthedocs.io/en/latest/discord.html. Then, click on "Bot" on the left side of the development portal. Next to the icon, it says "TOKEN", with a link to reveal the token, and one to copy it. This is the token you will need for your .env file in step 6.
-5. Turn on Developer Mode in Discord: Settings > Appearance > Developer Mode (on the bottom)
-6. Fill in the .env file. Here's what mine looks like. To get the channel IDs, right click on the channel in Discord and click "Copy ID" (this is what step 5 was for). ![env file](env-screenshot.PNG)
-7. For testing, set `TESTING=1` in your .env file. This will make it so that the last replay is automatically parsed when you start the program, and sends messages to your test channel.
-8. node main.js
+1. Setup your Discord bot https://discordpy.readthedocs.io/en/latest/discord.html. Then, click on "Bot" on the left side of the development portal. Next to the icon, it says "TOKEN", with a link to reveal the token, and one to copy it. This is the token you will need for your .env file in step 6.
+2. Turn on Developer Mode in Discord: Settings > Appearance > Developer Mode (on the bottom)
+3. Fill in the .env file. Here's what mine looks like. To get the channel IDs, right click on the channel in Discord and click "Copy ID" (this is what step 5 was for). ![env file](env-screenshot.PNG)
+4. For testing, set `TESTING=1` in your .env file. This will make it so that the last replay is automatically parsed when you start the program, and sends messages to your test channel.
