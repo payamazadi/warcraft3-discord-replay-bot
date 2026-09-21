@@ -1,5 +1,6 @@
 require('dotenv').config();
 const fs = require('fs');
+const path = require('path');
 const chokidar = require('chokidar');
 const W3GReplay = require('w3gjs').default;
 const axios = require('axios');
@@ -100,12 +101,23 @@ function fileSignature(p) {
 }
 
 function watchReplays() {
-  const watcher = chokidar.watch(REPLAYLOCATION, {
+  // Watch the DIRECTORY, not the single file: the game may replace
+  // LastReplay.w3g (delete + recreate) at game start, which a single-file
+  // watch can miss. We filter events down to the watched filename.
+  const watchDir = path.dirname(REPLAYLOCATION);
+  const baseName = path.basename(REPLAYLOCATION);
+  const watcher = chokidar.watch(watchDir, {
     ignoreInitial: true,
-    awaitWriteFinish: { stabilityThreshold: 2000, pollInterval: 200 },
+    awaitWriteFinish: {
+      // short stability: at game start the replay sits as a header-only file
+      // during loading (no writes), and we want THAT event immediately.
+      stabilityThreshold: 750,
+      pollInterval: 200,
+    },
   });
-  watcher.on('add', onReplayEvent).on('change', onReplayEvent);
-  console.log(`Watching ${REPLAYLOCATION} for new replays...`);
+  watcher.on('add', (p) => { if (path.basename(p) === baseName) onReplayEvent(p); });
+  watcher.on('change', (p) => { if (path.basename(p) === baseName) onReplayEvent(p); });
+  console.log(`Watching ${watchDir} for ${baseName} changes...`);
 
   // dry-run and testing parse the existing replay at startup (testing posts it);
   // an explicit file from argv overrides the watched path
@@ -147,26 +159,33 @@ async function handleReplayEvent(p) {
     return;
   }
 
-  // idle: a replay appeared. Full parse succeeding + no further writes means
-  // it's a finished replay (or a copy of one). Otherwise it's a game in
-  // progress — announce it with live stats.
-  let result = null;
+  // idle: something wrote the replay file. Could be a live game (header
+  // written at start, data appended during play) or a finished replay
+  // (game end / a copy). Distinguish:
+  //   file quiet + complete parse + real game duration -> end summary
+  //   still being written, or parse fails, or zero-duration parse     -> game start
+  let parsed = null;
   try {
-    result = await new W3GReplay().parse(p);
+    parsed = await parseWithLeaves(p);
   } catch {
-    result = null; // partial replay — expected for a game in progress
+    parsed = null; // partial replay — expected for a game in progress
   }
   if (replayState !== 'idle') return; // re-entered while we were parsing
 
   const growing = await fileStillGrowing(p);
-  if (growing) {
+  if (replayState !== 'idle') return;
+
+  if (!growing && parsed && parsed.result.duration >= 30000) {
+    await postGameEnd(p, parsed.result, parsed.leaves);
+    return;
+  }
+
+  try {
+    await postGameStart(p); // reads players from the header, posts live stats
     replayState = 'in_game';
-    await postGameStart(p);
     armEndCheck(p);
-  } else if (result) {
-    await postGameEnd(p, result);
-  } else {
-    console.log('Replay file is truncated and no longer being written; ignoring it.');
+  } catch (err) {
+    console.log(`Could not read game-start info from ${p}: ${err.message}`);
   }
 }
 
@@ -196,22 +215,38 @@ async function checkForGameEnd(p) {
   const sig = fileSignature(p);
   if (sig && sig !== lastSignature) return; // still writing; next event re-arms
 
-  let result = null;
+  let parsed = null;
   try {
-    result = await new W3GReplay().parse(p);
+    parsed = await parseWithLeaves(p);
   } catch {
-    result = null;
+    parsed = null;
   }
-  if (result) {
+  if (parsed) {
     replayState = 'idle';
     clearTimeout(endCheckTimer);
-    await postGameEnd(p, result);
+    await postGameEnd(p, parsed.result, parsed.leaves);
   } else if (Date.now() - lastChangeAtMs > GIVE_UP_AFTER_MS) {
     replayState = 'idle';
     console.log('Game replay never became parseable; giving up on this game.');
   } else {
     armEndCheck(p); // still not parseable; keep waiting a bit longer
   }
+}
+
+// High-level parse plus the raw leave events (gamedatablock id 23), which the
+// high-level result doesn't expose but winner detection needs.
+function parseWithLeaves(p) {
+  return new Promise((resolve, reject) => {
+    const parser = new W3GReplay();
+    const leaves = [];
+    parser.on('gamedatablock', (b) => {
+      if (b.id === 23) leaves.push(b);
+    });
+    parser.parse(p).then(
+      (result) => resolve({ result, leaves }),
+      (err) => reject(err),
+    );
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +323,7 @@ async function postGameStart(p) {
   await sendToChannel(embed);
 }
 
-async function postGameEnd(p, result) {
+async function postGameEnd(p, result, leaves = []) {
   numSessionGames++;
   totalSessionDuration += result.duration;
   avgSessionDuration = totalSessionDuration / numSessionGames;
@@ -297,7 +332,7 @@ async function postGameEnd(p, result) {
   for (const player of result.players) {
     if (namePart(player.name) === namePart(PLAYERNAME)) myTeam = player.teamid;
   }
-  const iWon = myTeam !== null && winningTeam(result) === myTeam;
+  const iWon = myTeam !== null && winningTeam(result, leaves) === myTeam;
   if (myTeam !== null) {
     if (iWon) numWins++;
     else numLosses++;
@@ -363,13 +398,39 @@ function printEmbed(embed, label) {
   console.log('=============================\n');
 }
 
-// w3gjs reports the winning team directly on modern replays. For odd games
-// where it can't be determined (-1), fall back to the old heuristic: the team
-// whose players spent the most time in game was on the winning side.
-function winningTeam(result) {
+// Winner detection, most reliable first:
+//
+// 1. w3gjs reports winningTeamId on modern replays — but only for 1v1 games.
+// 2. Team games: at game end the SURVIVING (winning) players each receive a
+//    leave event with reason 0c000000 ("game over"), while eliminated players
+//    left earlier with reason 010000000. Verified against replay leave dumps:
+//    the 0c-leavers' team is the winner. (The result field of these events is
+//    inconsistent — ignore it.)
+// 3. If the replay ends at the recorder's own defeat, the winners never get to
+//    leave at all: the team(s) with NO leave event won.
+// 4. Last resort: the team whose players spent the most time in game.
+function winningTeam(result, leaves = []) {
   if (result.winningTeamId !== undefined && result.winningTeamId !== -1) {
     return result.winningTeamId;
   }
+  const playerById = (pid) => result.players.find((p) => String(p.id) === String(pid));
+
+  const gameOverTeams = new Set();
+  for (const L of leaves) {
+    if (String(L.reason) !== '0c000000') continue;
+    const pl = playerById(L.playerId);
+    if (pl) gameOverTeams.add(pl.teamid);
+  }
+  if (gameOverTeams.size === 1) return Number([...gameOverTeams][0]);
+
+  const leftTeams = new Set();
+  for (const L of leaves) {
+    const pl = playerById(L.playerId);
+    if (pl) leftTeams.add(pl.teamid);
+  }
+  const neverLeftTeams = new Set(result.players.map((p) => p.teamid).filter((t) => !leftTeams.has(t)));
+  if (neverLeftTeams.size === 1) return Number([...neverLeftTeams][0]);
+
   const teamTime = {};
   for (const p of result.players) {
     teamTime[p.teamid] = (teamTime[p.teamid] || 0) + (p.currentTimePlayed || 0);
