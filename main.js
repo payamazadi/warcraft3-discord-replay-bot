@@ -294,10 +294,11 @@ function raceLetter(flag) {
 
 async function postGameStart(p) {
   const header = await headerPlayers(p);
+  const statsMap = await fetchStatsBatch(header.players.map((pl) => pl.name));
 
   const rows = [];
   for (const pl of header.players) {
-    const s = pl.name.includes('#') ? await statsFor(pl.name) : { kind: 'none' };
+    const s = statsEntry(statsMap, pl.name);
     rows.push([pl.name, raceCode(pl), careerCell(s), seasonCell(s)]);
   }
 
@@ -326,13 +327,13 @@ async function postGameEnd(p, result, leaves = []) {
     else numLosses++;
   }
 
-  const stats = await Promise.all(result.players.map((pl) => (pl.name.includes('#') ? statsFor(pl.name) : { kind: 'none' })));
-  const rows = result.players.map((pl, i) => [
+  const statsMap = await fetchStatsBatch(result.players.map((p) => p.name));
+  const rows = result.players.map((pl) => [
     pl.name,
     raceCode(pl),
     String(pl.apm),
-    careerCell(stats[i]),
-    seasonCell(stats[i]),
+    careerCell(statsEntry(statsMap, pl.name)),
+    seasonCell(statsEntry(statsMap, pl.name)),
   ]);
 
   const embed = new EmbedBuilder();
@@ -443,29 +444,35 @@ function safeValue(v) {
 
 // ---------------------------------------------------------------------------
 // Player W/L stats — fetched LIVE from the running game via the stats service.
-// No cache: every replay triggers fresh lookups for every player.
+// No cache: every replay triggers fresh lookups for every player. All players
+// go out in ONE batched request so the service talks to the game efficiently.
 // ---------------------------------------------------------------------------
 
-// Returns { kind: 'ok', wl: {career, season} } | { kind: 'nogames' | 'offline' |
-// 'timeout' | 'error' | 'none' }
-async function statsFor(name) {
+// Returns { <playerName>: { wl: {career, season}, ... } | { error, detail } }
+async function fetchStatsBatch(names) {
+  const tags = [...new Set(names.filter((n) => n.includes('#')))];
+  if (tags.length === 0) return {};
+  const res = await axios.get(`${STATSURL}/profiles`, {
+    params: { tags: tags.join(',') },
+    // One batch covers the whole game: the service may rescan the bridge
+    // (memory scan) before answering, so allow a few minutes.
+    timeout: 240000,
+  });
+  return (res.data && res.data.results) || {};
+}
+
+// Map a batch entry to the {kind} shape the cell formatters consume.
+function statsEntry(statsMap, name) {
   if (!name.includes('#')) return { kind: 'none' }; // AI/"Computer" players
-  let res;
-  try {
-    // Generous timeout: the service talks to the game serially, and if the
-    // game was just restarted its first request may include a bridge rescan.
-    res = await axios.get(`${STATSURL}/profile/${encodeURIComponent(name)}`, { timeout: 90000 });
-  } catch (err) {
-    const status = err.response && err.response.status;
-    if (status === 404) return { kind: 'nogames' };
-    if (status === 503) return { kind: 'offline' };
-    if (status === 504) return { kind: 'timeout' };
-    console.log(`Stats lookup failed for ${name}: ${err.message}`);
-    return { kind: 'error' };
-  }
-  const wl = res.data && res.data.wl;
-  if (!wl || !wl.career) return { kind: 'nogames' };
-  return { kind: 'ok', wl };
+  if (!statsMap) return { kind: 'offline' };        // batch request failed
+  const entry = statsMap[name];
+  if (!entry) return { kind: 'error' };
+  if (entry.wl && entry.wl.career) return { kind: 'ok', wl: entry.wl };
+  const code = entry.error;
+  if (code === 'player_not_found') return { kind: 'nogames' };
+  if (code === 'bridge_unavailable') return { kind: 'offline' };
+  if (code === 'fetch_timeout') return { kind: 'timeout' };
+  return { kind: 'error' };
 }
 
 function wlCell({ wins, losses }) {
