@@ -4,6 +4,7 @@ const path = require('path');
 const chokidar = require('chokidar');
 const W3GReplay = require('w3gjs').default;
 const axios = require('axios');
+const { parseInProgressReplay } = require('./temp-replay-parser.js');
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 
 // ---------------------------------------------------------------------------
@@ -15,8 +16,9 @@ const PLAYERNAME = process.env.PLAYERNAME;
 const TESTINGCHANNELID = process.env.TESTINGCHANNELID;
 const REALCHANNELID = process.env.REALCHANNELID;
 
-// Base URL of the live stats service (wc3-re service/live-server.js, port 8080).
-// Every profile lookup is fetched fresh from the running game — there is no cache.
+// Base URL of the live stats service (service/live-server.js in this repo,
+// port 8080). Every profile lookup is fetched fresh from the running game —
+// there is no cache.
 const STATSURL = (process.env.STATSURL || 'http://127.0.0.1:8080').replace(/\/+$/, '');
 
 // TESTING=1 -> post to TESTINGCHANNELID instead of REALCHANNELID, and parse the
@@ -61,7 +63,6 @@ let pendingReplayPath = null;
 
 const GAME_END_QUIET_MS = 15000;    // no writes for this long -> game is over
 const GIVE_UP_AFTER_MS = 180000;    // file quiet but unparseable -> give up eventually
-const HEADER_PARSE_TIMEOUT_MS = 15000;
 
 // ---------------------------------------------------------------------------
 // Discord client
@@ -100,23 +101,21 @@ function fileSignature(p) {
 }
 
 function watchReplays() {
-  // Watch the DIRECTORY, not the single file: the game may replace
-  // LastReplay.w3g (delete + recreate) at game start, which a single-file
-  // watch can miss. We filter events down to the watched filename.
+  // Watch the DIRECTORY, not a single file: the game writes TempReplay.w3g
+  // (encrypted, created the moment a match starts) and LastReplay.w3g (the
+  // decrypted dump at game end). We react only to those two names.
   const watchDir = path.dirname(REPLAYLOCATION);
-  const baseName = path.basename(REPLAYLOCATION);
+  const watched = new Set([path.basename(REPLAYLOCATION), 'TempReplay.w3g']);
   const watcher = chokidar.watch(watchDir, {
     ignoreInitial: true,
     awaitWriteFinish: {
-      // short stability: at game start the replay sits as a header-only file
-      // during loading (no writes), and we want THAT event immediately.
       stabilityThreshold: 750,
       pollInterval: 200,
     },
   });
-  watcher.on('add', (p) => { if (path.basename(p) === baseName) onReplayEvent(p); });
-  watcher.on('change', (p) => { if (path.basename(p) === baseName) onReplayEvent(p); });
-  console.log(`Watching ${watchDir} for ${baseName} changes...`);
+  watcher.on('add', (p) => { if (watched.has(path.basename(p))) onReplayEvent(p); });
+  watcher.on('change', (p) => { if (watched.has(path.basename(p))) onReplayEvent(p); });
+  console.log(`Watching ${watchDir} for ${[...watched].join(' / ')} changes...`);
 
   // dry-run and testing parse the existing replay at startup (testing posts it);
   // an explicit file from argv overrides the watched path
@@ -152,35 +151,42 @@ async function handleReplayEvent(p) {
   lastSignature = sig;
   lastChangeAtMs = Date.now();
 
+  const isTemp = path.basename(p).toLowerCase() === 'tempreplay.w3g';
+
   if (replayState === 'in_game') {
-    // replay is growing; the end-check timer posts when writes stop
-    armEndCheck(p);
+    // A game is underway; only LastReplay.w3g ends it. TempReplay writes
+    // during the match are just the encrypted replay growing.
+    if (!isTemp) armEndCheck(p);
     return;
   }
 
-  // idle: something wrote the replay file. The game dumps the replay when a
-  // game finishes (and creates a header-only file when one starts), so:
-  //   complete parse + real game duration -> end summary
-  //   parse fails or tiny duration        -> game just started, post live stats
+  if (isTemp) {
+    // TempReplay.w3g is created the moment a match starts. Its data blocks are
+    // compressed (not encrypted) — human battleTags can be extracted live, so
+    // we can post everyone's stats before the game finishes.
+    replayState = 'in_game';
+    try {
+      await postGameStart(p);
+    } catch (err) {
+      console.log('Game-start post failed:', err.message);
+    }
+    return;
+  }
+
+  // idle: LastReplay.w3g was written — the game dumps the completed replay
+  // here when a game finishes. Parse it and post the summary.
   let parsed = null;
   try {
     parsed = await parseWithLeaves(p);
   } catch {
-    parsed = null; // partial/header-only replay — expected right at game start
+    parsed = null;
   }
-  if (replayState !== 'idle') return; // re-entered while we were parsing
+  if (replayState !== 'idle') return;
 
   if (parsed && parsed.result.duration >= 30000) {
     await postGameEnd(p, parsed.result, parsed.leaves);
-    return;
-  }
-
-  try {
-    await postGameStart(p); // reads players from the header, posts live stats
-    replayState = 'in_game';
-    armEndCheck(p);
-  } catch (err) {
-    console.log(`Could not read game-start info from ${p}: ${err.message}`);
+  } else {
+    console.log('LastReplay changed but is not a parseable finished game; ignoring.');
   }
 }
 
@@ -238,75 +244,35 @@ function parseWithLeaves(p) {
 }
 
 // ---------------------------------------------------------------------------
-// "Game starting" — read players from the replay header only
+// "Game starting" — fired when TempReplay.w3g appears (the moment a match
+// starts). The in-progress replay is a compressed block stream without its
+// final header; we inflate what's on disk and extract the human battleTags,
+// then post each player's LIVE stats (fetched through the stats service).
+// The full result summary follows in postGameEnd when the game finishes.
 // ---------------------------------------------------------------------------
-function headerPlayers(p) {
-  return new Promise((resolve, reject) => {
-    // W3GReplay extends the low-level parser and emits basic_replay_information
-    // once the header is read — before block parsing hits the end of a partial
-    // (in-progress) replay file.
-    const parser = new W3GReplay();
-    const timer = setTimeout(() => {
-      reject(new Error('header parse timeout'));
-    }, HEADER_PARSE_TIMEOUT_MS);
-    parser.on('basic_replay_information', (info) => {
-      clearTimeout(timer);
-      const byId = {};
-      for (const rec of info.metadata.playerRecords || []) byId[rec.playerId] = { ...rec };
-      for (const extra of info.metadata.reforgedPlayerMetadata || []) {
-        if (byId[extra.playerId]) byId[extra.playerId].playerName = extra.name;
-        else byId[extra.playerId] = { playerId: extra.playerId, playerName: extra.name };
-      }
-      const players = [];
-      for (const slot of info.metadata.slotRecords || []) {
-        if (slot.slotStatus <= 1) continue; // empty slot
-        players.push({
-          id: slot.playerId,
-          name: (byId[slot.playerId] && byId[slot.playerId].playerName) || 'Computer',
-          teamid: slot.teamId,
-          race: raceLetter(slot.raceFlag),
-        });
-      }
-      resolve({ players, map: (info.metadata && info.metadata.map) || (info.map) || null });
-    });
-    parser.parse(p).catch((err) => {
-      clearTimeout(timer);
-      // the header event usually fired before block parsing hits a partial file
-      reject(err);
-    });
-  });
-}
+async function postGameStart(tempPath) {
+  const embed = new EmbedBuilder().setTitle('Game starting').setColor(0x0099ff);
 
-// mirror of w3gjs raceFlagFormatter (kept inline to avoid deep-import drift)
-function raceLetter(flag) {
-  switch (flag) {
-    case 0x01:
-    case 0x41: return 'H';
-    case 0x02:
-    case 0x42: return 'O';
-    case 0x04:
-    case 0x44: return 'N';
-    case 0x08:
-    case 0x48: return 'U';
-    default: return 'R';
+  try {
+    const buf = fs.readFileSync(tempPath);
+    const { battleTags } = parseInProgressReplay(buf);
+    if (battleTags.length === 0) {
+      embed.setDescription('A match is underway (no human players detected in the replay yet).');
+    } else {
+      const statsMap = await fetchStatsBatch(battleTags);
+      const rows = battleTags.map((tag) => {
+        const s = statsEntry(statsMap, tag);
+        return [tag, careerCell(s), seasonCell(s)];
+      });
+      embed.addFields({
+        name: 'Players (live records)',
+        value: monoTable(['Player', 'Career', 'Season'], rows),
+      });
+    }
+  } catch (err) {
+    embed.setDescription('A match is underway (replay not readable yet — stats will come with the result).');
+    console.log('Game-start parse failed:', err.message);
   }
-}
-
-async function postGameStart(p) {
-  const header = await headerPlayers(p);
-  const statsMap = await fetchStatsBatch(header.players.map((pl) => pl.name));
-
-  const rows = [];
-  for (const pl of header.players) {
-    const s = statsEntry(statsMap, pl.name);
-    rows.push([pl.name, raceCode(pl), careerCell(s), seasonCell(s)]);
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle('Game starting')
-    .setColor(0x0099ff)
-    .addFields({ name: 'Map', value: safeValue(header.map && (header.map.file || header.map)) })
-    .addFields({ name: 'Players', value: monoTable(['Player', 'Race', 'Career', 'Season'], rows) });
 
   if (dryrun) return printEmbed(embed, '(game start)');
   await sendToChannel(embed);
@@ -435,11 +401,6 @@ function winningTeam(result, leaves = []) {
 // PLAYERNAME may be set either way — compare on the name part, case-insensitively.
 function namePart(name) {
   return String(name).split('#')[0].toLowerCase();
-}
-
-function safeValue(v) {
-  const s = String(v || 'unknown');
-  return s.length > 1024 ? s.slice(0, 1021) + '...' : s;
 }
 
 // ---------------------------------------------------------------------------
