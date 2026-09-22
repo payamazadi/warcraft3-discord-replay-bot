@@ -47,21 +47,25 @@ let totalSessionDuration = 0;
 let longestGame = 0;
 let numWins = 0;
 let numLosses = 0;
-let lastSignature = null;
 
-// Replay writing lifecycle: the game (re)creates LastReplay.w3g when a game
-// starts and keeps appending to it until the game finishes. So a change event
-// mid-game means the file is a partial replay — enough to read the header
-// (players, teams, races) but not to summarize. We post a "Game starting"
-// message with live W/L for every player right away, then wait for writes to
-// go quiet and post the full summary.
+// Replay writing lifecycle: when a match starts the game creates TempReplay.w3g
+// (compressed data blocks, encrypted-looking but just zlib without the final
+// header) and streams into it while the match runs. When the match ends it
+// dumps a completed replay into LastReplay.w3g. Both files persist between
+// games, so every event is deduplicated per file by size+mtime, and a
+// "Game starting" post fires only for a genuinely new match: file creation
+// ('add'), or an existing TempReplay that is actively growing.
+let lastTempSig = null;     // temp content as of the last event we handled
+let lastReplaySig = null;   // LastReplay content as of the last event we handled
 let replayState = 'idle'; // 'idle' | 'in_game'
 let endCheckTimer = null;
 let lastChangeAtMs = 0;
 let handlingReplay = false;
 let pendingReplayPath = null;
+let pendingReplayType = null;
 
 const GAME_END_QUIET_MS = 15000;    // no writes for this long -> game is over
+const GROWTH_CHECK_MS = 3000;       // re-stat after this long to detect live writing
 const GIVE_UP_AFTER_MS = 180000;    // file quiet but unparseable -> give up eventually
 
 // ---------------------------------------------------------------------------
@@ -113,8 +117,8 @@ function watchReplays() {
       pollInterval: 200,
     },
   });
-  watcher.on('add', (p) => { if (watched.has(path.basename(p))) onReplayEvent(p); });
-  watcher.on('change', (p) => { if (watched.has(path.basename(p))) onReplayEvent(p); });
+  const handler = (type) => (p) => { if (watched.has(path.basename(p))) onReplayEvent(p, type); };
+  watcher.on('add', handler('add')).on('change', handler('change'));
   console.log(`Watching ${watchDir} for ${[...watched].join(' / ')} changes...`);
 
   // dry-run and testing parse the existing replay at startup (testing posts it);
@@ -127,35 +131,44 @@ function watchReplays() {
 }
 
 // chokidar can fire faster than we handle; collapse to the newest event
-function onReplayEvent(p) {
+function onReplayEvent(p, type) {
   if (handlingReplay) {
     pendingReplayPath = p;
+    pendingReplayType = type;
     return;
   }
   handlingReplay = true;
-  handleReplayEvent(p)
+  handleReplayEvent(p, type)
     .catch((err) => console.log('Error handling replay event:', err.message))
     .finally(() => {
       handlingReplay = false;
       if (pendingReplayPath) {
         const next = pendingReplayPath;
+        const nextType = pendingReplayType;
         pendingReplayPath = null;
-        onReplayEvent(next);
+        pendingReplayType = null;
+        onReplayEvent(next, nextType);
       }
     });
 }
 
-async function handleReplayEvent(p) {
-  const sig = fileSignature(p);
-  if (!sig || sig === lastSignature) return;
-  lastSignature = sig;
-  lastChangeAtMs = Date.now();
-
+async function handleReplayEvent(p, type) {
   const isTemp = path.basename(p).toLowerCase() === 'tempreplay.w3g';
+  const sig = fileSignature(p);
+  if (!sig) return;
+
+  if (isTemp) {
+    if (sig === lastTempSig) return; // no change since we handled it
+    lastTempSig = sig;
+  } else {
+    if (sig === lastReplaySig) return;
+    lastReplaySig = sig;
+  }
+  lastChangeAtMs = Date.now();
 
   if (replayState === 'in_game') {
     // A game is underway; only LastReplay.w3g ends it. TempReplay writes
-    // during the match are just the encrypted replay growing.
+    // during the match are just the compressed replay growing.
     if (!isTemp) armEndCheck(p);
     return;
   }
@@ -164,6 +177,12 @@ async function handleReplayEvent(p) {
     // TempReplay.w3g is created the moment a match starts. Its data blocks are
     // compressed (not encrypted) — human battleTags can be extracted live, so
     // we can post everyone's stats before the game finishes.
+    // A rewritten temp ('change', not 'add') only counts as a new match if the
+    // file is actively growing — static menu-time touches don't count.
+    if (type !== 'add') {
+      const growing = await fileStillGrowing(p);
+      if (!growing) return;
+    }
     replayState = 'in_game';
     try {
       await postGameStart(p);
@@ -191,6 +210,13 @@ async function handleReplayEvent(p) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fileStillGrowing(p) {
+  const before = fileSignature(p);
+  await sleep(GROWTH_CHECK_MS);
+  const after = fileSignature(p);
+  return Boolean(before && after && before !== after);
+}
 
 // While in a game: when the file has gone quiet, try the full parse. Quiet for
 // GAME_END_QUIET_MS usually means the game finished and flushed the replay.
