@@ -45,6 +45,7 @@ let myTeam = null;
 let numSessionGames = 0;
 let totalSessionDuration = 0;
 let longestGame = 0;
+let avgSessionDuration = 0;
 let numWins = 0;
 let numLosses = 0;
 
@@ -67,6 +68,7 @@ let pendingReplayType = null;
 const GAME_END_QUIET_MS = 15000;    // no writes for this long -> game is over
 const GROWTH_CHECK_MS = 3000;       // re-stat after this long to detect live writing
 const GIVE_UP_AFTER_MS = 180000;    // file quiet but unparseable -> give up eventually
+const GAME_START_GIVE_UP_MS = 180000; // keep retrying the game-start post this long
 
 // ---------------------------------------------------------------------------
 // Discord client
@@ -184,11 +186,10 @@ async function handleReplayEvent(p, type) {
       if (!growing) return;
     }
     replayState = 'in_game';
-    try {
-      await postGameStart(p);
-    } catch (err) {
-      console.log('Game-start post failed:', err.message);
-    }
+    // Not awaited: postGameStart retries in the background until the temp
+    // replay contains player records, so a slow stats fetch must not block
+    // this handler (which also has to process the game-end event).
+    postGameStart(p).catch((err) => console.log('Game-start post failed:', err.message));
     return;
   }
 
@@ -233,7 +234,7 @@ function armEndCheck(p) {
 async function checkForGameEnd(p) {
   if (replayState !== 'in_game') return;
   const sig = fileSignature(p);
-  if (sig && sig !== lastSignature) return; // still writing; next event re-arms
+  if (sig && sig !== lastReplaySig) return; // still writing; next event re-arms
 
   let parsed = null;
   try {
@@ -271,33 +272,55 @@ function parseWithLeaves(p) {
 
 // ---------------------------------------------------------------------------
 // "Game starting" — fired when TempReplay.w3g appears (the moment a match
-// starts). The in-progress replay is a compressed block stream without its
-// final header; we inflate what's on disk and extract the human battleTags,
-// then post each player's LIVE stats (fetched through the stats service).
-// The full result summary follows in postGameEnd when the game finishes.
+// starts). At that moment the file is usually still a stub: the game doesn't
+// write player records until the loading screen finishes. So this is a
+// background retry loop — re-read the temp replay every few seconds until the
+// human battleTags are readable, then post each player's LIVE stats (fetched
+// through the stats service). If the service keeps failing we post the table
+// with "(offline)" cells; if the replay never yields players we say so after
+// GAME_START_GIVE_UP_MS. If the game ends first, no post — the full result
+// summary from postGameEnd supersedes it.
 // ---------------------------------------------------------------------------
 async function postGameStart(tempPath) {
-  const embed = new EmbedBuilder().setTitle('Game starting').setColor(0x0099ff);
+  const deadline = Date.now() + GAME_START_GIVE_UP_MS;
+  let battleTags = null;
+  let statsMap = null;
+  let warnedStatsDown = false;
 
-  try {
-    const buf = fs.readFileSync(tempPath);
-    const { battleTags } = parseInProgressReplay(buf);
-    if (battleTags.length === 0) {
-      embed.setDescription('A match is underway (no human players detected in the replay yet).');
-    } else {
-      const statsMap = await fetchStatsBatch(battleTags);
-      const rows = battleTags.map((tag) => {
-        const s = statsEntry(statsMap, tag);
-        return [tag, careerCell(s), seasonCell(s)];
-      });
-      embed.addFields({
-        name: 'Players (live records)',
-        value: monoTable(['Player', 'Career', 'Season'], rows),
-      });
+  while (replayState === 'in_game' && Date.now() < deadline) {
+    try {
+      const parsed = parseInProgressReplay(fs.readFileSync(tempPath));
+      if (parsed.battleTags.length > 0) {
+        battleTags = parsed.battleTags;
+        try {
+          statsMap = await fetchStatsBatch(parsed.battleTags);
+          break;
+        } catch (err) {
+          if (!warnedStatsDown) {
+            console.log('Game-start stats fetch failed; will keep retrying:', err.message);
+            warnedStatsDown = true;
+          }
+        }
+      }
+    } catch {
+      // temp replay is still a stub — player records aren't written yet
     }
-  } catch (err) {
-    embed.setDescription('A match is underway (replay not readable yet — stats will come with the result).');
-    console.log('Game-start parse failed:', err.message);
+    await sleep(GROWTH_CHECK_MS);
+  }
+  if (replayState !== 'in_game') return; // game ended first; the result post wins
+
+  const embed = new EmbedBuilder().setTitle('Game starting').setColor(0x0099ff);
+  if (!battleTags) {
+    embed.setDescription('A match is underway (no human players detected in the replay yet).');
+  } else {
+    const rows = battleTags.map((tag) => {
+      const s = statsMap ? statsEntry(statsMap, tag) : { kind: 'offline' };
+      return [tag, careerCell(s), seasonCell(s)];
+    });
+    embed.addFields({
+      name: 'Players (live records)',
+      value: monoTable(['Player', 'Career', 'Season'], rows),
+    });
   }
 
   if (dryrun) return printEmbed(embed, '(game start)');
