@@ -496,6 +496,7 @@ function statsEntry(statsMap, name) {
   const entry = statsMap[name];
   if (!entry) return { kind: 'error' };
   if (entry.wl && entry.wl.career) return { kind: 'ok', wl: entry.wl };
+  if (!entry.error) return { kind: 'nogames' }; // profile fetched; wl null => no ladder games
   const code = entry.error;
   if (code === 'player_not_found') return { kind: 'nogames' };
   if (code === 'bridge_unavailable') return { kind: 'offline' };
