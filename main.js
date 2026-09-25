@@ -64,6 +64,7 @@ let lastChangeAtMs = 0;
 let handlingReplay = false;
 let pendingReplayPath = null;
 let pendingReplayType = null;
+let gameStartMessage = null;  // sent "Game starting" message, edited into the result at game end
 
 const GAME_END_QUIET_MS = 15000;    // no writes for this long -> game is over
 const GROWTH_CHECK_MS = 3000;       // re-stat after this long to detect live writing
@@ -186,6 +187,7 @@ async function handleReplayEvent(p, type) {
       if (!growing) return;
     }
     replayState = 'in_game';
+    gameStartMessage = null; // a new game must not edit the previous game's message
     // Not awaited: postGameStart retries in the background until the temp
     // replay contains player records, so a slow stats fetch must not block
     // this handler (which also has to process the game-end event).
@@ -279,7 +281,8 @@ function parseWithLeaves(p) {
 // through the stats service). If the service keeps failing we post the table
 // with "(offline)" cells; if the replay never yields players we say so after
 // GAME_START_GIVE_UP_MS. If the game ends first, no post — the full result
-// summary from postGameEnd supersedes it.
+// summary from postGameEnd supersedes it (it edits this message in place, so
+// each game is exactly one Discord message).
 // ---------------------------------------------------------------------------
 async function postGameStart(tempPath) {
   const deadline = Date.now() + GAME_START_GIVE_UP_MS;
@@ -324,7 +327,7 @@ async function postGameStart(tempPath) {
   }
 
   if (dryrun) return printEmbed(embed, '(game start)');
-  await sendToChannel(embed);
+  gameStartMessage = await sendToChannel(embed);
 }
 
 async function postGameEnd(p, result, leaves = []) {
@@ -373,6 +376,20 @@ async function postGameEnd(p, result, leaves = []) {
   );
 
   if (dryrun) return printEmbed(embed, '(game end)');
+
+  // One message per game: turn the "Game starting" post into the result. If
+  // the message is gone (deleted, missing permissions), post a new one.
+  const target = gameStartMessage;
+  gameStartMessage = null;
+  if (target) {
+    try {
+      await target.edit({ embeds: [embed] });
+      console.log('Edited the game-start message into the result summary.');
+      return;
+    } catch (err) {
+      console.log('Editing the game-start message failed; posting a new one:', err.message);
+    }
+  }
   await sendToChannel(embed);
 }
 
@@ -389,8 +406,9 @@ async function sendToChannel(embed) {
     console.log(`Channel ${channelId} not found — is the bot in that server?`);
     return;
   }
-  await channel.send({ embeds: [embed] });
+  const message = await channel.send({ embeds: [embed] });
   console.log(`Posted replay summary to channel ${channelId}`);
+  return message;
 }
 
 function printEmbed(embed, label) {
