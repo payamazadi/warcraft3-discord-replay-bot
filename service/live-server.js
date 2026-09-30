@@ -185,6 +185,36 @@ async function openBridge() {
   }
 }
 
+// ------------------------------------------------------------------ team telemetry
+// The game sometimes PUSHES team/ranked payloads (TeamsInformation,
+// RankedSeasonStatsUpdate) to connected webui clients — unprompted, as its own
+// UI updates. Arranged-team records are expected to live there: they are not
+// part of per-player profiles. Keep one PASSIVE listener socket open (nothing
+// is ever sent on it), record what arrives, and serve it at GET /teams so the
+// payload shapes can be inspected and later surfaced in the bot's embeds.
+const teamTelemetry = [];
+
+function startTeamMonitor() {
+  const retryIn = (ms) => setTimeout(startTeamMonitor, ms);
+  const bridge = readBridge();
+  if (!bridge) return retryIn(30000);
+  connectBridge(bridge.port, bridge.guid, 5000).then((ws) => {
+    log('team monitor: listening (passive)');
+    ws.addEventListener('message', (ev) => {
+      let obj; try { obj = JSON.parse(ev.data); } catch { return; }
+      for (const m of (Array.isArray(obj) ? obj : [obj])) {
+        if (!m || !m.messageType || !/team|ranked/i.test(m.messageType)) continue;
+        teamTelemetry.push({ atUtc: new Date().toISOString(), type: m.messageType, payload: m.payload });
+        if (teamTelemetry.length > 50) teamTelemetry.shift();
+        log(`team monitor: captured ${m.messageType} (${JSON.stringify(m.payload).length} bytes)`);
+      }
+    });
+    ws.addEventListener('close', () => retryIn(15000));
+  }, () => {
+    rescan('team monitor connect failed').finally(() => retryIn(10000));
+  });
+}
+
 function send(ws, message, payload) {
   ws.send(JSON.stringify({ type: 'webui', message, payload }));
 }
@@ -236,13 +266,16 @@ function fetchOne(ws, battleTag, gatewayId) {
   });
 }
 
-// Extract {profile, toonStats, rankedSeasonStats} from collected events
+// Extract {profile, toonStats, rankedSeasonStats} from collected events. The
+// game can push several updates per request (a partial toon-stats snapshot
+// followed by the complete one — observed as a 2505 vs 3214 career for the
+// same account), so keep the LAST of each type, not the first.
 function pickPayloads(events) {
   const out = {};
   for (const e of events) {
-    if (e.messageType === 'UpdateProfileData' && !out.profile) out.profile = e.payload && e.payload.details;
-    if (e.messageType === 'UpdateProfileDataWithToonStats' && !out.toonStats) out.toonStats = e.payload && e.payload.details;
-    if (e.messageType === 'RankedSeasonStatsUpdate' && !out.rankedSeasonStats) out.rankedSeasonStats = e.payload;
+    if (e.messageType === 'UpdateProfileData') out.profile = e.payload && e.payload.details;
+    if (e.messageType === 'UpdateProfileDataWithToonStats') out.toonStats = e.payload && e.payload.details;
+    if (e.messageType === 'RankedSeasonStatsUpdate') out.rankedSeasonStats = e.payload;
   }
   return out;
 }
@@ -401,6 +434,7 @@ const server = http.createServer((req, res) => {
       lastFetchAtUtc: stats.lastFetchAtUtc,
       lastError: stats.lastError,
       inFlight: inFlight.size,
+      teamEventsCaptured: teamTelemetry.length,
     });
     return;
   }
@@ -462,6 +496,12 @@ const server = http.createServer((req, res) => {
       .catch(() => sendJson(res, 500, { error: 'internal_error' }));
     return;
   }
+  if (rawPath === '/teams') {
+    return sendJson(res, 200, {
+      note: 'passive capture of team/ranked payloads the game pushes by itself; nothing is requested from the game',
+      captured: teamTelemetry,
+    });
+  }
   if (rawPath === '/' || rawPath === '') {
     return sendJson(res, 200, {
       service: 'wc3-live-stats',
@@ -474,6 +514,7 @@ const server = http.createServer((req, res) => {
 });
 
 readBridge();
+startTeamMonitor();
 server.listen(PORT, '127.0.0.1', () => {
   log(`wc3 live stats service listening on http://127.0.0.1:${PORT} (no cache — every fetch is live)`);
   log(`bridge.json: ${BRIDGE_JSON} ${stats.bridge ? `(port ${stats.bridge.port}, scanned ${stats.bridge.scannedAt})` : '(missing — will rescan on first fetch)'}`);
