@@ -39,6 +39,7 @@ const FIND_BRIDGE = path.resolve(SERVICE_DIR, argOf('--find-bridge', 'find-bridg
 const FIRST_EVENT_TIMEOUT_MS = 6000; // wait for UpdateProfileData
 const QUIET_MS = 1200;               // after last profile event, wait this long for stragglers
 const INTER_PLAYER_PAUSE_MS = 250;   // pacing between GetProfile requests
+const GATEWAY_IDS = [0, 20, 30];     // 0 = home region, 20 = Europe, 30 = Asia
 const RESCAN_MIN_INTERVAL_MS = 20 * 1000;
 
 // ------------------------------------------------------------------ state
@@ -188,8 +189,9 @@ function send(ws, message, payload) {
   ws.send(JSON.stringify({ type: 'webui', message, payload }));
 }
 
-// One battleTag, one already-open websocket. Resolves with collected events.
-function fetchOne(ws, battleTag) {
+// One battleTag, one already-open websocket, one gateway. Resolves with
+// collected events.
+function fetchOne(ws, battleTag, gatewayId) {
   return new Promise((resolve) => {
     const events = [];
     let gotProfileData = false;
@@ -230,7 +232,7 @@ function fetchOne(ws, battleTag) {
     ws.addEventListener('close', onClose);
     hardTimer = setTimeout(() => finish(gotProfileData ? 'quiet' : 'no_response'), FIRST_EVENT_TIMEOUT_MS);
 
-    send(ws, 'GetProfile', { battleTag, gatewayId: 0, clanTags: '' });
+    send(ws, 'GetProfile', { battleTag, gatewayId, clanTags: '' });
   });
 }
 
@@ -287,6 +289,36 @@ function computeWl(picked) {
   return null;
 }
 
+// A battleTag can exist on several regional gateways with SEPARATE ladder
+// records. gatewayId 0 (home) resolves same-region players and the logged-in
+// account, but an out-of-region player comes back as a profile shell with
+// empty toon stats — e.g. an Asia player looks like "no games" from an
+// Americas client (their real account sits on gateway 30). So: try home
+// first, then the other regions, and keep the first response that carries
+// actual stats. A profile with no stats on ANY gateway is a genuine
+// no-ladder account — fall back to the home-gateway profile for that.
+function statsPresent(picked) {
+  const ts = picked.toonStats && picked.toonStats.seasons;
+  if (Array.isArray(ts) && ts.length > 0) return true;
+  return Array.isArray(picked.profile && picked.profile.matchmaked_stats)
+    && picked.profile.matchmaked_stats.length > 0;
+}
+
+async function fetchAcrossGateways(ws, battleTag) {
+  let last = { events: [], reason: 'no_response' };
+  let firstProfile = null;
+  for (const gatewayId of GATEWAY_IDS) {
+    const attempt = await fetchOne(ws, battleTag, gatewayId);
+    const picked = pickPayloads(attempt.events);
+    if (picked.profile) {
+      if (!firstProfile) firstProfile = attempt;
+      if (statsPresent(picked)) return attempt;
+    }
+    last = attempt;
+  }
+  return firstProfile || last;
+}
+
 // The whole live fetch for one tag, run on the queue with a fresh connection
 // per burst (a burst = one HTTP /profile call, possibly with several tags in
 // the future; today each request is one tag).
@@ -299,15 +331,18 @@ function liveFetch(battleTag) {
         try {
           ws = await openBridge();
 
-          const { events, reason } = await fetchOne(ws, battleTag);
+          const { events, reason } = await fetchAcrossGateways(ws, battleTag);
           const picked = pickPayloads(events);
           if (!picked.profile) {
             const err = new Error(
               reason === 'socket_closed'
                 ? 'game closed the bridge connection mid-fetch'
-                : `no profile returned for ${battleTag}`,
+                : reason === 'no_response'
+                  ? `game did not answer GetProfile for ${battleTag} on any gateway`
+                  : `no profile returned for ${battleTag}`,
             );
-            err.code = reason === 'socket_closed' ? 'bridge_unavailable' : 'player_not_found';
+            err.code = reason === 'socket_closed' ? 'bridge_unavailable'
+              : reason === 'no_response' ? 'fetch_timeout' : 'player_not_found';
             throw err;
           }
           const tag = picked.profile.battle_tag_full || battleTag;
